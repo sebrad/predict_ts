@@ -1,0 +1,311 @@
+
+# generate matrix with lags up to k-th order
+gen_lagged_regressors <- function(y = y, k = 3){
+  # y ... matrix
+  # k ... lags
+  
+  if(!is.matrix(y) | ncol(y) != 1) stop("y has to be a matrix with one column")
+
+  n <- nrow(y)
+  k <- 3
+  mat <- matrix(rep(NA, k * n), ncol = k)
+  colnames(mat) <- paste0("lag_", 1:k)
+  for(i in 1:k) 
+    mat[,i] <- c(rep(NA,i),y[-(n:(n-i+1))])
+  return(mat)
+  }---
+title: "Notes"
+author: "Sebastian Radlwimmer"
+date: "22 August 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Iterative Predictions
+
+Ziel diese kleinen Projektes ist es einen Prognose-workflow aufzubauen, der es erlaubt ML-Algorithmen wie Glmnet oder RandomForest mit Lagged-Predictors aufzusetzen und iterative Prognosen damit zu erstellen. Iterativ bedeutet, dass die prognosewerte für weitere prognosen, die weiter als einen schritt in die zukunft gehen, als regressoren verwendet werden. Das Projekt soll dabei so allgemein gehalten werden, dass es mögich ist, beliebige saiosnalitäten zu verwenden.
+
+Optional sollen die predictions in caret implementiert werden.
+
+## Bausteine
+
+Es wird mit dem paket fpp2, forecast, glmnet und ranger gestartet. 
+
+```{r}
+# Pakete Laden
+library(fpp2)
+library(forecast)
+library(glmnet)
+library(ranger)
+
+data <- elecdaily
+
+# generate matrix out of vector
+# with lags up to the k-th order
+gen_lagged_regressors <- function(y = y, lags = 3){
+  # y ... matrix or vector
+  # k ... lags
+  if(is.matrix(y)) y <- as.vector(y)
+  if(!(is.vector(y)|is.matrix(y))) stop("y has to be a matrix with one column or a vector")
+  n <- length(y)
+  mat <- matrix(rep(NA, length.out = length(lags) * n), ncol = length(lags))
+  colnames(mat) <- paste0("lag_", lags)
+  for(i in seq_along(lags)) 
+    mat[,i] <- c(rep(NA,i),y[-(n:(n-i+1))])
+  return(mat)
+  }
+```
+
+Das ts-format kann dabei nicht verwendet werden, da glmnet und ranger andere formate benötigen. In einem ersten Schritt werden keine Zuküftigen externen regressoren produziert.
+
+```{r}
+lags <- c(1:21)
+data <- as.data.frame(data)
+data <- cbind(data, gen_lagged_regressors(y = data$Demand, lags = lags))
+data <- na.omit(data)
+
+y <- as.matrix(data[,1])
+x <- as.matrix(data[,-1])
+  
+# train und test
+#bis <- floor(.8 * nrow(data))
+bis <- 200
+tr <- 1:bis
+te <- (bis+1):nrow(data)
+ytr <- y[tr]
+yte <- y[te]
+xtr <- x[tr,]
+xte <- x[te,]
+
+# fit vanilla cv.glmnet
+fit <- cv.glmnet(x = xtr, y = ytr, alpha = .1)
+
+# predict iteratively into testset
+predict_ts_cv.glmnet <- function(object, newx, s = "lambda.1se", h, lagvars = paste0("lag_", lags)){
+  preds <- numeric(h)
+  for(k in 1:h){
+    preds[k] <- predict.cv.glmnet(object = object, newx = newx[k,,drop = F], s = s)
+    lag_oldx <- newx[k,lagvars]
+    if(k<h)
+    newx[k+1,lagvars] <- c(preds[k], lag_oldx[-length(lag_oldx)])  
+  }  
+  return(preds)
+}
+
+# calculate mse
+mse <- function(obs, preds){
+  mean((obs - preds)^2)
+}
+
+preds1 <- predict_ts_cv.glmnet(object = fit, newx = xte, h = nrow(xte), lagvars = paste0("lag_", lags))
+
+```
+
+
+# plot results
+
+```{r}
+plot(y, type = "l")
+lines(predict(fit, newx = xtr, "lambda.1se"), col = "steelblue")
+lines(te,preds1, col = "red")
+```
+
+# Versuch 2 mit quadratischen termen
+
+```{r}
+
+y <- as.matrix(data[,1])
+data$Temperature_sq <- data$Temperature^2
+x <- as.matrix(data[,-1])
+  
+# train und test
+tr <- 1:bis
+te <- (bis+1):nrow(data)
+ytr <- y[tr]
+yte <- y[te]
+xtr <- x[tr,]
+xte <- x[te,]
+
+# fit and plot vanilla cv.glmnet mit quadratischen termen
+fit <- cv.glmnet(x = xtr, y = ytr, alpha = .1)
+coef(fit, "lambda.1se")
+
+preds2 <- predict_ts_cv.glmnet(object = fit, newx = xte, h = nrow(xte), lagvars = paste0("lag_", lags))
+
+plot(y, type = "l")
+lines(predict(fit, newx = xtr, "lambda.1se"), col = "steelblue")
+lines(te,preds2, col = "red")
+
+```
+
+
+# Versuch 3 mit adaptiv lasso
+
+
+```{r}
+
+y <- as.matrix(data[,1])
+data$Temperature_sq <- data$Temperature^2
+x <- as.matrix(data[,-1])
+  
+# train und test
+tr <- 1:bis
+te <- (bis+1):nrow(data)
+ytr <- y[tr]
+yte <- y[te]
+xtr <- x[tr,]
+xte <- x[te,]
+
+# calculate weights
+fit <- cv.glmnet(x = xtr, y = ytr, alpha = 0)
+w <- abs(1/coef(fit, "lambda.1se")[-1])^.5
+
+# fit and plot adaptive lasso mit quadratischen termen
+fit <- cv.glmnet(x = xtr, y = ytr, alpha = 1, penalty.factor = w)
+preds3 <- predict_ts_cv.glmnet(object = fit, newx = xte, h = nrow(xte), lagvars = paste0("lag_", lags))
+
+plot(y, type = "l")
+lines(predict(fit, newx = xtr, "lambda.1se"), col = "steelblue")
+lines(te,preds3, col = "red")
+```
+
+
+# ranger
+
+```{r}
+data$Temperature_sq <- data$Temperature^2
+
+# train und test
+tr <- 1:bis
+te <- (bis+1):nrow(data)
+dat_tr <- data[tr,]
+dat_te <- data[te,]
+
+
+# fit ranger
+library(ranger)
+fit <- ranger(Demand ~ ., data = dat_tr)
+
+# predict ranger iteratively into testset
+predict_ts_ranger <- function(object, data, h, lagvars = paste0("lag_", 1:21), ...){
+  if(!is.data.frame(data)) stop("data has to be a data.frame")
+  preds <- numeric(h)
+  for(k in 1:h){
+    pre <- ranger:::predict.ranger(object = object, data = data[k,,drop = F])
+    preds[k] <- pre$predictions 
+    lag_olddata <- data[k,lagvars]
+    if(k<h)
+    data[k+1,lagvars] <- c(preds[k], lag_olddata[-length(lag_olddata)])  
+  }  
+  return(preds)
+}
+
+preds_rf <- predict_ts_ranger(object = fit, data = dat_te, h = nrow(dat_te), lagvars = paste0("lag_", lags))
+
+plot(y, type = "l")
+lines(ranger:::predict.ranger(fit, data = dat_tr)$predictions, col = "steelblue")
+lines(te,preds_rf, col = "red")
+
+
+```
+
+# visualler vergleich mit auto.arima und xreg
+
+```{r}
+yts <- ts(ytr, freq = 7)
+fit <- auto.arima(yts, xreg = xtr[,c("WorkDay", "Temperature", "Temperature_sq")])
+fc <- forecast(fit, h = nrow(xte), xreg = xte[,c("WorkDay", "Temperature", "Temperature_sq")])
+plot(fc, PI =F)
+lines(ts(yte, freq = 7, start = attr(yts, "tsp")[2]+1/7), col = "grey")
+
+```
+
+
+# MSE berechnen
+
+```{r}
+mse(yte, preds1)
+mse(yte, preds2)
+mse(yte, preds3)
+mse(yte, preds_rf)
+mse(yte, fc$mean)
+```
+
+
+# estimate effects based on glmnet
+
+```{r}
+y <- as.matrix(data[,1])
+data$Temperature_sq <- data$Temperature^2
+x <- as.matrix(data[,-1])
+  
+# train und test
+tr <- 1:bis
+te <- (bis+1):nrow(data)
+ytr <- y[tr]
+yte <- y[te]
+xtr <- x[tr,]
+xte <- x[te,]
+
+# fit and plot vanilla cv.glmnet mit quadratischen termen
+fit <- cv.glmnet(x = xtr, y = ytr, alpha = .1)
+
+
+# EFFECTS xtr
+eff <- "WorkDay"
+
+# calculate baseline
+baseline_x <- xtr
+baseline_x[,colnames(baseline_x) %in% eff] <- 0
+baseline <- predict.cv.glmnet(object = fit, newx = baseline_x)
+
+# calculate effects
+mat <- matrix(rep(NA, length(eff) * length(baseline)), ncol = length(eff))
+if(ncol(mat) > 1){
+  for(m in seq_along(eff)){
+    tmp <- xtr
+    tmp[,colnames(tmp) != eff[m]] <- 0
+    yy <- predict.cv.glmnet(object = fit, newx = tmp)
+    mat[,m] <- ifelse(yy == baseline, NA, yy)
+  } 
+} else {
+  tmp <- xtr
+  yy <- predict.cv.glmnet(object = fit, newx = tmp)
+  mat[,1] <- ifelse(yy == baseline, NA, yy)
+}
+
+plot(y, type = "l")
+lines(baseline, col = "blue")
+lines(mat[,1], col = "red")
+
+
+# forecast baseline
+baseline_x <- xte
+baseline_x[,colnames(baseline_x) %in% eff] <- 0
+baseline <- predict_ts_cv.glmnet(object = fit, newx = baseline_x, h = nrow(baseline_x), lagvars = paste0("lag_", lags))
+
+# calculate effects
+mat <- matrix(rep(NA, length(eff) * length(baseline)), ncol = length(eff))
+if(ncol(mat) > 1){
+  for(m in seq_along(eff)){
+    tmp <- xte
+    tmp[,colnames(tmp) != eff[m]] <- 0
+    yy <- predict_ts_cv.glmnet(object = fit, newx = tmp, h = nrow(tmp), lagvars = paste0("lag_", lags))
+    mat[,m] <- ifelse(yy == baseline, NA, yy)
+  } 
+} else {
+  tmp <- xte
+  yy <- predict_ts_cv.glmnet(object = fit, newx = tmp, h = nrow(tmp), lagvars = paste0("lag_", lags))
+  mat[,1] <- ifelse(yy == baseline, NA, yy)
+}
+
+
+lines(te, baseline, col = "blue", lty = 2)
+lines(te, mat[,1], col = "red", lty = 2)
+
+
+```
+
